@@ -17,6 +17,14 @@ From the project root (or any subdirectory inside it):
 python3 ~/.codex/skills/waylog-journal/scripts/waylog_journal.py
 ```
 
+Recommended fast pass (initial per-session summaries):
+
+```bash
+python3 ~/.codex/skills/waylog-journal/scripts/waylog_journal.py \
+  --model gpt-5.1-codex-mini \
+  --reasoning-effort low
+```
+
 ## Prerequisites
 
 To collect/pull transcripts into `.waylog/history/`, install WayLog CLI (`waylog`):
@@ -35,6 +43,8 @@ Useful flags:
 - `--force` (regenerate everything)
 - `--codex-history-persistence save-all|none` (default: `none` to avoid writing Codex history)
 - `--codex-cd <path>` (overrides Codex `--cd`; default: temp dir)
+- `--codex-mcp disable-all|inherit` (default: `disable-all` to avoid MCP tool usage during summarization)
+- `--codex-config <key=value>` (repeatable; passed through as `codex -c ...`)
 - `--model <name>` (override default Codex model)
 - `--reasoning-effort <level>` (override `model_reasoning_effort`)
 - `--no-prompt` (never ask; always use Codex defaults unless flags/env are set)
@@ -44,7 +54,7 @@ Useful flags:
 ## What to do when this skill is active
 
 1. If the user didn’t specify `--model` / `--reasoning-effort`, ask them what to use (or confirm using
-   their Codex defaults).
+   their Codex defaults). Suggest a fast pass (`gpt-5.1-codex-mini` + `low`) unless higher fidelity is needed.
 1. Run the script (it invokes `codex exec` once per changed history file, plus one optional pass to
    generate the condensed journal).
 1. Open `.waylog-journal/summary.md` and sanity-check for:
@@ -72,6 +82,8 @@ Useful flags:
 - By default, the script runs Codex with `history.persistence=none` and a temp working root (`--cd`) to reduce the
   chance that `waylog pull` ingests these summarization runs. Set `--codex-history-persistence save-all` if you
   explicitly want to keep Codex history.
+- By default, the script disables MCP servers for these runs (`--codex-mcp disable-all`) to avoid tool usage and
+  external API calls. Set `--codex-mcp inherit` to keep Codex MCP settings.
 - The script writes `.waylog-journal/sessions.md` incrementally after each updated entry, so it’s safe
   to interrupt and re-run; completed entries are skipped based on per-file `sha256`.
 - Expect model usage/cost: `codex exec` runs once per changed history file, plus (by default) one

@@ -354,6 +354,58 @@ def json_load_loose(text: str) -> dict[str, Any]:
         return json.loads(text[start : end + 1])
 
 
+def list_codex_mcp_servers(codex_bin: str) -> list[dict[str, Any]]:
+    try:
+        proc = subprocess.run(
+            [codex_bin, "mcp", "list", "--json"],
+            text=True,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        eprint(f"[warn] codex binary not found: {codex_bin!r}")
+        return []
+
+    if proc.returncode != 0:
+        eprint("[warn] `codex mcp list --json` failed; continuing without MCP overrides.")
+        return []
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        eprint("[warn] Failed to parse `codex mcp list --json` output; continuing without MCP overrides.")
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    servers: list[dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict):
+            servers.append(item)
+    return servers
+
+
+def build_codex_mcp_disable_overrides(
+    servers: list[dict[str, Any]],
+    *,
+    only_enabled: bool,
+) -> list[str]:
+    overrides: list[str] = []
+    for server in servers:
+        name = server.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if only_enabled and not bool(server.get("enabled")):
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            eprint(f"[warn] Skipping MCP server with unsupported name: {name!r}")
+            continue
+        overrides.append(f"mcp_servers.{name}.enabled=false")
+    return overrides
+
+
 def run_codex_summary(
     *,
     repo_root: Path,
@@ -362,6 +414,7 @@ def run_codex_summary(
     reasoning_effort: str | None,
     history_persistence: str,
     codex_cd: Path | None,
+    codex_config: list[str],
     schema_path: Path,
     prompt: str,
 ) -> dict[str, Any]:
@@ -374,6 +427,8 @@ def run_codex_summary(
     cmd.extend(["-c", f'history.persistence="{history_persistence}"'])
     if reasoning_effort:
         cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+    for cfg in codex_config:
+        cmd.extend(["-c", cfg])
     if codex_cd is not None:
         cmd.extend(["--cd", str(codex_cd)])
     cmd.extend(
@@ -426,6 +481,7 @@ def run_codex_journal(
     reasoning_effort: str | None,
     history_persistence: str,
     codex_cd: Path | None,
+    codex_config: list[str],
     schema_path: Path,
     prompt: str,
 ) -> str:
@@ -436,6 +492,7 @@ def run_codex_journal(
         reasoning_effort=reasoning_effort,
         history_persistence=history_persistence,
         codex_cd=codex_cd,
+        codex_config=codex_config,
         schema_path=schema_path,
         prompt=prompt,
     )
@@ -769,6 +826,18 @@ def main(argv: list[str]) -> int:
         help="Run Codex with `--cd` set to this directory (default: temp dir)",
     )
     parser.add_argument(
+        "--codex-mcp",
+        choices=["disable-all", "inherit"],
+        default="disable-all",
+        help="MCP server behavior for Codex runs (default: disable-all)",
+    )
+    parser.add_argument(
+        "--codex-config",
+        action="append",
+        default=[],
+        help="Extra `codex -c` config overrides (repeatable)",
+    )
+    parser.add_argument(
         "--model",
         default=os.environ.get("CODEX_MODEL"),
         help="Override Codex model (default: use Codex config / profile)",
@@ -906,6 +975,12 @@ def main(argv: list[str]) -> int:
         )
 
     with tempfile.TemporaryDirectory() as td:
+        codex_config: list[str] = []
+        if args.codex_mcp == "disable-all":
+            servers = list_codex_mcp_servers(args.codex_bin)
+            codex_config.extend(build_codex_mcp_disable_overrides(servers, only_enabled=False))
+        codex_config.extend([str(cfg) for cfg in (args.codex_config or []) if str(cfg).strip()])
+
         codex_cd = (
             Path(args.codex_cd).expanduser().resolve() if args.codex_cd else Path(td) / "codex-cd"
         )
@@ -947,6 +1022,7 @@ def main(argv: list[str]) -> int:
                         reasoning_effort=reasoning_effort,
                         history_persistence=args.codex_history_persistence,
                         codex_cd=codex_cd,
+                        codex_config=codex_config,
                         schema_path=summary_schema_path,
                         prompt=prompt,
                     )
@@ -1045,6 +1121,7 @@ def main(argv: list[str]) -> int:
                     reasoning_effort=reasoning_effort,
                     history_persistence=args.codex_history_persistence,
                     codex_cd=codex_cd,
+                    codex_config=codex_config,
                     schema_path=journal_schema_path,
                     prompt=prompt,
                 )
