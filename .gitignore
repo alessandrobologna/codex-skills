@@ -10,8 +10,10 @@
 !/waylog-journal/
 !/waylog-journal/**
 
+!/mermaid-github-safe-area/
+!/mermaid-github-safe-area/**
+
 # Always ignore local/runtime artifacts (even inside allowlisted skills).
 **/__pycache__/
 *.py[cod]
 .DS_Store
-
