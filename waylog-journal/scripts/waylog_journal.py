@@ -407,7 +407,8 @@ def build_codex_mcp_disable_overrides(
 
 
 def parse_codex_exec_usage_from_jsonl(stdout: str) -> dict[str, int] | None:
-    usage: dict[str, int] | None = None
+    usage_total: dict[str, int] = {}
+    saw_usage = False
     for line in stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -430,9 +431,12 @@ def parse_codex_exec_usage_from_jsonl(stdout: str) -> dict[str, int] | None:
                 parsed[key] = value
             elif isinstance(value, str) and value.isdigit():
                 parsed[key] = int(value)
-        if parsed:
-            usage = parsed
-    return usage
+        if not parsed:
+            continue
+        saw_usage = True
+        for key, value in parsed.items():
+            usage_total[key] = usage_total.get(key, 0) + value
+    return usage_total if saw_usage else None
 
 
 def run_codex_summary(
