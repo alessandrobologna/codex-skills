@@ -61,6 +61,7 @@ Useful flags:
    - Chronological order preserved
    - Only important decisions/implementation details captured
    - No secrets/credentials/PII (everything sensitive must be redacted)
+1. Check the script’s printed token usage summary (input/cached/output) and re-run with a smaller model if needed.
 1. Validate the journal against the repo (quick final pass):
    - Skim `git log --oneline --decorate -n 100` for major milestones and date alignment
    - Spot-check key claims with `rg` (e.g. tool names, file names, feature keywords)

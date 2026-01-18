@@ -406,6 +406,35 @@ def build_codex_mcp_disable_overrides(
     return overrides
 
 
+def parse_codex_exec_usage_from_jsonl(stdout: str) -> dict[str, int] | None:
+    usage: dict[str, int] | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") != "turn.completed":
+            continue
+        raw_usage = event.get("usage")
+        if not isinstance(raw_usage, dict):
+            continue
+        parsed: dict[str, int] = {}
+        for key in ("input_tokens", "cached_input_tokens", "output_tokens"):
+            value = raw_usage.get(key)
+            if isinstance(value, int):
+                parsed[key] = value
+            elif isinstance(value, str) and value.isdigit():
+                parsed[key] = int(value)
+        if parsed:
+            usage = parsed
+    return usage
+
+
 def run_codex_summary(
     *,
     repo_root: Path,
@@ -417,7 +446,7 @@ def run_codex_summary(
     codex_config: list[str],
     schema_path: Path,
     prompt: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, int] | None]:
     with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False) as out:
         out_path = Path(out.name)
 
@@ -445,6 +474,7 @@ def run_codex_summary(
             str(schema_path),
             "--output-last-message",
             str(out_path),
+            "--json",
             "-",
         ]
     )
@@ -465,7 +495,8 @@ def run_codex_summary(
             )
         content = out_path.read_text(encoding="utf-8", errors="replace").strip()
         data = json_load_loose(content)
-        return data
+        usage = parse_codex_exec_usage_from_jsonl(proc.stdout or "")
+        return data, usage
     finally:
         try:
             out_path.unlink(missing_ok=True)
@@ -484,8 +515,8 @@ def run_codex_journal(
     codex_config: list[str],
     schema_path: Path,
     prompt: str,
-) -> str:
-    data = run_codex_summary(
+) -> tuple[str, dict[str, int] | None]:
+    data, usage = run_codex_summary(
         repo_root=repo_root,
         codex_bin=codex_bin,
         model=model,
@@ -499,7 +530,7 @@ def run_codex_journal(
     journal = data.get("journal_markdown")
     if not isinstance(journal, str):
         raise RuntimeError("Journal output missing `journal_markdown` string.")
-    return journal
+    return journal, usage
 
 
 def make_prompt(repo_root: Path, session: HistorySession, sensitive_categories: list[str]) -> str:
@@ -986,6 +1017,14 @@ def main(argv: list[str]) -> int:
         )
         codex_cd.mkdir(parents=True, exist_ok=True)
 
+        codex_calls_total: int = 0
+        codex_calls_with_usage: int = 0
+        codex_usage_total: dict[str, int] = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+        }
+
         summary_schema_path = Path(td) / "waylog_summary_schema.json"
         summary_schema_path.write_text(json.dumps(SUMMARY_SCHEMA, indent=2), encoding="utf-8")
 
@@ -1015,7 +1054,8 @@ def main(argv: list[str]) -> int:
 
                 status = "ok"
                 try:
-                    data = run_codex_summary(
+                    codex_calls_total += 1
+                    data, usage = run_codex_summary(
                         repo_root=repo_root,
                         codex_bin=args.codex_bin,
                         model=model,
@@ -1026,6 +1066,11 @@ def main(argv: list[str]) -> int:
                         schema_path=summary_schema_path,
                         prompt=prompt,
                     )
+                    if usage is not None:
+                        codex_calls_with_usage += 1
+                        codex_usage_total["input_tokens"] += usage.get("input_tokens", 0)
+                        codex_usage_total["cached_input_tokens"] += usage.get("cached_input_tokens", 0)
+                        codex_usage_total["output_tokens"] += usage.get("output_tokens", 0)
                 except Exception as exc:
                     eprint(f"[warn] Failed to summarize {session.rel_path}: {exc}")
                     status = "error"
@@ -1114,7 +1159,8 @@ def main(argv: list[str]) -> int:
                         "",
                     ]
                 )
-                journal_body = run_codex_journal(
+                codex_calls_total += 1
+                journal_body, usage = run_codex_journal(
                     repo_root=repo_root,
                     codex_bin=args.codex_bin,
                     model=model,
@@ -1125,6 +1171,11 @@ def main(argv: list[str]) -> int:
                     schema_path=journal_schema_path,
                     prompt=prompt,
                 )
+                if usage is not None:
+                    codex_calls_with_usage += 1
+                    codex_usage_total["input_tokens"] += usage.get("input_tokens", 0)
+                    codex_usage_total["cached_input_tokens"] += usage.get("cached_input_tokens", 0)
+                    codex_usage_total["output_tokens"] += usage.get("output_tokens", 0)
                 journal_body = sanitize_text(journal_body)
                 new_journal_text = render_journal_file(
                     journal_body, sessions_sha=sessions_sha, previous_text=existing_journal_text
@@ -1135,6 +1186,25 @@ def main(argv: list[str]) -> int:
                 eprint(f"Journal up-to-date ({journal_file}).")
         else:
             eprint("Skipped journal generation (--no-journal).")
+
+        if codex_calls_total and codex_calls_with_usage:
+            input_tokens = codex_usage_total["input_tokens"]
+            cached_input_tokens = codex_usage_total["cached_input_tokens"]
+            output_tokens = codex_usage_total["output_tokens"]
+            uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
+            missing = codex_calls_total - codex_calls_with_usage
+            msg = (
+                "Codex token usage: "
+                f"input={input_tokens} (cached={cached_input_tokens}, uncached={uncached_input_tokens}), "
+                f"output={output_tokens}"
+            )
+            if missing:
+                msg += f" (usage unavailable for {missing}/{codex_calls_total} runs)"
+            eprint(msg)
+        elif codex_calls_total:
+            eprint(
+                f"Codex token usage unavailable ({codex_calls_total} runs; no `turn.completed.usage` events found)."
+            )
     return 0
 
 
