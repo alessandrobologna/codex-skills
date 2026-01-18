@@ -1,0 +1,17 @@
+# Codex skills publish allowlist.
+# Ignore everything by default, then explicitly allowlist skills to publish.
+
+/*
+
+!.gitignore
+!README.md
+!LICENSE
+
+!/waylog-journal/
+!/waylog-journal/**
+
+# Always ignore local/runtime artifacts (even inside allowlisted skills).
+**/__pycache__/
+*.py[cod]
+.DS_Store
+
