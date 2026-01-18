@@ -41,10 +41,12 @@ Useful flags:
 
 - `--dry-run` (see what would change without calling the model)
 - `--force` (regenerate everything)
+- `--codex-home <path>` (run Codex with a different `CODEX_HOME`; useful if `~/.codex/sessions` is not writable)
 - `--codex-history-persistence save-all|none` (default: `none` to avoid writing Codex history)
 - `--codex-cd <path>` (overrides Codex `--cd`; default: temp dir)
 - `--codex-mcp disable-all|inherit` (default: `disable-all` to avoid MCP tool usage during summarization)
 - `--codex-config <key=value>` (repeatable; passed through as `codex -c ...`)
+- `--codex-retries <n>` / `--codex-retry-backoff-sec <sec>` (retry transient Codex/network failures)
 - `--model <name>` (override default Codex model)
 - `--reasoning-effort <level>` (override `model_reasoning_effort`)
 - `--no-prompt` (never ask; always use Codex defaults unless flags/env are set)
@@ -85,10 +87,17 @@ Useful flags:
   explicitly want to keep Codex history.
 - By default, the script disables MCP servers for these runs (`--codex-mcp disable-all`) to avoid tool usage and
   external API calls. Set `--codex-mcp inherit` to keep Codex MCP settings.
+- If Codex cannot write session files under `~/.codex/sessions`, the script retries with an isolated temp `CODEX_HOME`
+  (seeded from your existing Codex auth/config when available). You can also set `--codex-home <path>` explicitly.
 - The script writes `.waylog-journal/sessions.md` incrementally after each updated entry, so it’s safe
   to interrupt and re-run; completed entries are skipped based on per-file `sha256`.
 - Expect model usage/cost: `codex exec` runs once per changed history file, plus (by default) one
   additional `codex exec` to generate the condensed journal if the sessions changed.
+
+## Troubleshooting
+
+- `401 Unauthorized` / “Missing bearer…”: Codex is not logged in in this environment. Run `codex login status`, then `codex login` (or `printenv OPENAI_API_KEY | codex login --with-api-key`).
+- Network errors (e.g. “stream disconnected”): Re-run, consider `--codex-retries`, and consider lowering `--max-chars`.
 
 ## Examples (user prompts that should trigger this skill)
 

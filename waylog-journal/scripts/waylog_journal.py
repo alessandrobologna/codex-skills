@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -354,7 +355,7 @@ def json_load_loose(text: str) -> dict[str, Any]:
         return json.loads(text[start : end + 1])
 
 
-def list_codex_mcp_servers(codex_bin: str) -> list[dict[str, Any]]:
+def list_codex_mcp_servers(codex_bin: str, *, env: dict[str, str] | None) -> list[dict[str, Any]]:
     try:
         proc = subprocess.run(
             [codex_bin, "mcp", "list", "--json"],
@@ -362,6 +363,7 @@ def list_codex_mcp_servers(codex_bin: str) -> list[dict[str, Any]]:
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
     except FileNotFoundError:
         eprint(f"[warn] codex binary not found: {codex_bin!r}")
@@ -406,6 +408,82 @@ def build_codex_mcp_disable_overrides(
     return overrides
 
 
+def is_codex_sessions_permission_error(stderr: str) -> bool:
+    s = stderr.lower()
+    if "permission denied" not in s and "operation not permitted" not in s:
+        return False
+    if "sessions" not in s:
+        return False
+    return ".codex" in s or "codex" in s
+
+
+def is_codex_auth_error(stderr: str) -> bool:
+    s = stderr.lower()
+    return ("unauthorized" in s) or ("missing bearer" in s) or (" 401" in s) or s.startswith("401")
+
+
+def is_retryable_codex_error(stderr: str) -> bool:
+    s = stderr.lower()
+    if is_codex_auth_error(stderr):
+        return False
+    if "permission denied" in s or "operation not permitted" in s:
+        return False
+    needles = [
+        "stream disconnected",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "temporary failure",
+        "network",
+        "broken pipe",
+        "tls",
+        "ssl",
+        "dns",
+    ]
+    return any(n in s for n in needles)
+
+
+def find_seed_codex_home() -> Path | None:
+    candidates: list[Path] = []
+    env_home = os.environ.get("CODEX_HOME")
+    if env_home:
+        candidates.append(Path(env_home).expanduser())
+    candidates.append(Path.home() / ".codex")
+
+    for candidate in candidates:
+        try:
+            candidate = candidate.expanduser()
+        except Exception:
+            continue
+        if (candidate / "auth.json").exists() or (candidate / "config.toml").exists():
+            return candidate
+    return None
+
+
+def seed_codex_home(dst: Path, seed_from: Path | None) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    if seed_from is None:
+        return
+
+    for filename in ("auth.json", "config.toml"):
+        src = seed_from / filename
+        dest = dst / filename
+        try:
+            if src.exists() and not dest.exists():
+                shutil.copy2(src, dest)
+        except Exception as exc:
+            eprint(f"[warn] Failed to copy {src} -> {dest}: {exc}")
+
+    src_rules = seed_from / "rules"
+    dest_rules = dst / "rules"
+    try:
+        if src_rules.is_dir() and not dest_rules.exists():
+            shutil.copytree(src_rules, dest_rules)
+    except Exception as exc:
+        eprint(f"[warn] Failed to copy rules dir {src_rules} -> {dest_rules}: {exc}")
+
+
 def parse_codex_exec_usage_from_jsonl(stdout: str) -> dict[str, int] | None:
     usage_total: dict[str, int] = {}
     saw_usage = False
@@ -448,6 +526,10 @@ def run_codex_summary(
     history_persistence: str,
     codex_cd: Path | None,
     codex_config: list[str],
+    codex_env: dict[str, str] | None,
+    codex_fallback_env: dict[str, str] | None,
+    retries: int,
+    retry_backoff_sec: float,
     schema_path: Path,
     prompt: str,
 ) -> tuple[dict[str, Any], dict[str, int] | None]:
@@ -484,19 +566,44 @@ def run_codex_summary(
     )
 
     try:
-        proc = subprocess.run(
-            cmd,
-            input=prompt,
-            text=True,
-            cwd=str(codex_cd or repo_root),
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"codex exec failed (exit {proc.returncode}). stderr:\n{proc.stderr.strip()}"
+        used_fallback = False
+        attempt_env = codex_env
+        attempt = 0
+        while True:
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                text=True,
+                cwd=str(codex_cd or repo_root),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=attempt_env,
             )
+            if proc.returncode == 0:
+                break
+
+            stderr = proc.stderr.strip()
+
+            if (
+                codex_fallback_env is not None
+                and not used_fallback
+                and is_codex_sessions_permission_error(stderr)
+            ):
+                used_fallback = True
+                attempt_env = codex_fallback_env
+                eprint("[warn] Codex sessions dir not writable; retrying with isolated CODEX_HOME.")
+                continue
+
+            if attempt < retries and is_retryable_codex_error(stderr):
+                sleep_sec = retry_backoff_sec * (2**attempt)
+                eprint(f"[warn] codex exec failed; retrying in {sleep_sec:.1f}s...")
+                time.sleep(sleep_sec)
+                attempt += 1
+                continue
+
+            raise RuntimeError(f"codex exec failed (exit {proc.returncode}). stderr:\n{stderr}")
+
         content = out_path.read_text(encoding="utf-8", errors="replace").strip()
         data = json_load_loose(content)
         usage = parse_codex_exec_usage_from_jsonl(proc.stdout or "")
@@ -517,6 +624,10 @@ def run_codex_journal(
     history_persistence: str,
     codex_cd: Path | None,
     codex_config: list[str],
+    codex_env: dict[str, str] | None,
+    codex_fallback_env: dict[str, str] | None,
+    retries: int,
+    retry_backoff_sec: float,
     schema_path: Path,
     prompt: str,
 ) -> tuple[str, dict[str, int] | None]:
@@ -528,6 +639,10 @@ def run_codex_journal(
         history_persistence=history_persistence,
         codex_cd=codex_cd,
         codex_config=codex_config,
+        codex_env=codex_env,
+        codex_fallback_env=codex_fallback_env,
+        retries=retries,
+        retry_backoff_sec=retry_backoff_sec,
         schema_path=schema_path,
         prompt=prompt,
     )
@@ -850,6 +965,11 @@ def main(argv: list[str]) -> int:
         help="Path to codex executable (default: codex)",
     )
     parser.add_argument(
+        "--codex-home",
+        default=None,
+        help="Run Codex with `CODEX_HOME` set to this directory (default: inherit)",
+    )
+    parser.add_argument(
         "--codex-history-persistence",
         choices=["save-all", "none"],
         default="none",
@@ -871,6 +991,18 @@ def main(argv: list[str]) -> int:
         action="append",
         default=[],
         help="Extra `codex -c` config overrides (repeatable)",
+    )
+    parser.add_argument(
+        "--codex-retries",
+        type=int,
+        default=2,
+        help="Retries for transient Codex failures (default: 2)",
+    )
+    parser.add_argument(
+        "--codex-retry-backoff-sec",
+        type=float,
+        default=1.0,
+        help="Retry backoff base seconds (default: 1.0)",
     )
     parser.add_argument(
         "--model",
@@ -1010,9 +1142,30 @@ def main(argv: list[str]) -> int:
         )
 
     with tempfile.TemporaryDirectory() as td:
+        base_env = os.environ.copy()
+        seed_home = find_seed_codex_home()
+        if seed_home is None:
+            eprint("[warn] Could not locate Codex auth/config to seed an isolated CODEX_HOME.")
+
+        codex_env = base_env.copy()
+        if args.codex_home:
+            codex_home = Path(args.codex_home).expanduser().resolve()
+            seed_codex_home(codex_home, seed_home)
+            codex_env["CODEX_HOME"] = str(codex_home)
+
+        codex_fallback_home = Path(td) / "codex-home"
+        seed_codex_home(codex_fallback_home, seed_home)
+        codex_fallback_env = base_env.copy()
+        codex_fallback_env["CODEX_HOME"] = str(codex_fallback_home)
+
+        codex_retries = max(0, int(args.codex_retries))
+        codex_retry_backoff_sec = max(0.0, float(args.codex_retry_backoff_sec))
+
         codex_config: list[str] = []
         if args.codex_mcp == "disable-all":
-            servers = list_codex_mcp_servers(args.codex_bin)
+            servers = list_codex_mcp_servers(args.codex_bin, env=codex_env)
+            if not servers:
+                servers = list_codex_mcp_servers(args.codex_bin, env=codex_fallback_env)
             codex_config.extend(build_codex_mcp_disable_overrides(servers, only_enabled=False))
         codex_config.extend([str(cfg) for cfg in (args.codex_config or []) if str(cfg).strip()])
 
@@ -1028,6 +1181,10 @@ def main(argv: list[str]) -> int:
             "cached_input_tokens": 0,
             "output_tokens": 0,
         }
+        printed_auth_hint = False
+        printed_network_hint = False
+        printed_permission_hint = False
+        had_failures = False
 
         summary_schema_path = Path(td) / "waylog_summary_schema.json"
         summary_schema_path.write_text(json.dumps(SUMMARY_SCHEMA, indent=2), encoding="utf-8")
@@ -1067,6 +1224,10 @@ def main(argv: list[str]) -> int:
                         history_persistence=args.codex_history_persistence,
                         codex_cd=codex_cd,
                         codex_config=codex_config,
+                        codex_env=codex_env,
+                        codex_fallback_env=codex_fallback_env,
+                        retries=codex_retries,
+                        retry_backoff_sec=codex_retry_backoff_sec,
                         schema_path=summary_schema_path,
                         prompt=prompt,
                     )
@@ -1077,6 +1238,26 @@ def main(argv: list[str]) -> int:
                         codex_usage_total["output_tokens"] += usage.get("output_tokens", 0)
                 except Exception as exc:
                     eprint(f"[warn] Failed to summarize {session.rel_path}: {exc}")
+                    had_failures = True
+                    msg = str(exc)
+                    if not printed_permission_hint and is_codex_sessions_permission_error(msg):
+                        printed_permission_hint = True
+                        eprint(
+                            "[hint] Codex could not write session files. Fix permissions on `~/.codex/sessions` "
+                            "or run with `--codex-home <writable-dir>`."
+                        )
+                    if not printed_network_hint and is_retryable_codex_error(msg):
+                        printed_network_hint = True
+                        eprint(
+                            "[hint] This looks like a network failure. Verify connectivity and re-run. "
+                            "Consider lowering `--max-chars`."
+                        )
+                    if not printed_auth_hint and is_codex_auth_error(msg):
+                        printed_auth_hint = True
+                        eprint(
+                            "[hint] Codex appears unauthenticated. Run `codex login status` and then `codex login`, "
+                            "or use `printenv OPENAI_API_KEY | codex login --with-api-key`."
+                        )
                     status = "error"
                     data = {
                         "project_relevance": {
@@ -1164,28 +1345,63 @@ def main(argv: list[str]) -> int:
                     ]
                 )
                 codex_calls_total += 1
-                journal_body, usage = run_codex_journal(
-                    repo_root=repo_root,
-                    codex_bin=args.codex_bin,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    history_persistence=args.codex_history_persistence,
-                    codex_cd=codex_cd,
-                    codex_config=codex_config,
-                    schema_path=journal_schema_path,
-                    prompt=prompt,
-                )
-                if usage is not None:
-                    codex_calls_with_usage += 1
-                    codex_usage_total["input_tokens"] += usage.get("input_tokens", 0)
-                    codex_usage_total["cached_input_tokens"] += usage.get("cached_input_tokens", 0)
-                    codex_usage_total["output_tokens"] += usage.get("output_tokens", 0)
-                journal_body = sanitize_text(journal_body)
-                new_journal_text = render_journal_file(
-                    journal_body, sessions_sha=sessions_sha, previous_text=existing_journal_text
-                )
-                write_atomic(journal_file, new_journal_text)
-                eprint(f"Updated {journal_file}.")
+                try:
+                    journal_body, usage = run_codex_journal(
+                        repo_root=repo_root,
+                        codex_bin=args.codex_bin,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                        history_persistence=args.codex_history_persistence,
+                        codex_cd=codex_cd,
+                        codex_config=codex_config,
+                        codex_env=codex_env,
+                        codex_fallback_env=codex_fallback_env,
+                        retries=codex_retries,
+                        retry_backoff_sec=codex_retry_backoff_sec,
+                        schema_path=journal_schema_path,
+                        prompt=prompt,
+                    )
+                    if usage is not None:
+                        codex_calls_with_usage += 1
+                        codex_usage_total["input_tokens"] += usage.get("input_tokens", 0)
+                        codex_usage_total["cached_input_tokens"] += usage.get(
+                            "cached_input_tokens", 0
+                        )
+                        codex_usage_total["output_tokens"] += usage.get("output_tokens", 0)
+                    journal_body = sanitize_text(journal_body)
+                    new_journal_text = render_journal_file(
+                        journal_body, sessions_sha=sessions_sha, previous_text=existing_journal_text
+                    )
+                    write_atomic(journal_file, new_journal_text)
+                    eprint(f"Updated {journal_file}.")
+                except Exception as exc:
+                    had_failures = True
+                    eprint(f"[warn] Failed to generate condensed journal: {exc}")
+                    msg = str(exc)
+                    if not printed_permission_hint and is_codex_sessions_permission_error(msg):
+                        printed_permission_hint = True
+                        eprint(
+                            "[hint] Codex could not write session files. Fix permissions on `~/.codex/sessions` "
+                            "or run with `--codex-home <writable-dir>`."
+                        )
+                    if not printed_network_hint and is_retryable_codex_error(msg):
+                        printed_network_hint = True
+                        eprint(
+                            "[hint] This looks like a network failure. Verify connectivity and re-run. "
+                            "Consider lowering `--max-chars`."
+                        )
+                    if not printed_auth_hint and is_codex_auth_error(msg):
+                        printed_auth_hint = True
+                        eprint(
+                            "[hint] Codex appears unauthenticated. Run `codex login status` and then `codex login`, "
+                            "or use `printenv OPENAI_API_KEY | codex login --with-api-key`."
+                        )
+                    if not journal_file.exists():
+                        placeholder = render_journal_file(
+                            "", sessions_sha=sessions_sha, previous_text=existing_journal_text
+                        )
+                        write_atomic(journal_file, placeholder)
+                        eprint(f"Wrote placeholder journal file ({journal_file}).")
             else:
                 eprint(f"Journal up-to-date ({journal_file}).")
         else:
@@ -1209,7 +1425,7 @@ def main(argv: list[str]) -> int:
             eprint(
                 f"Codex token usage unavailable ({codex_calls_total} runs; no `turn.completed.usage` events found)."
             )
-    return 0
+    return 1 if had_failures else 0
 
 
 if __name__ == "__main__":
