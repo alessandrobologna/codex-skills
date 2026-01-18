@@ -33,6 +33,8 @@ Useful flags:
 
 - `--dry-run` (see what would change without calling the model)
 - `--force` (regenerate everything)
+- `--codex-history-persistence save-all|none` (default: `none` to avoid writing Codex history)
+- `--codex-cd <path>` (overrides Codex `--cd`; default: temp dir)
 - `--model <name>` (override default Codex model)
 - `--reasoning-effort <level>` (override `model_reasoning_effort`)
 - `--no-prompt` (never ask; always use Codex defaults unless flags/env are set)
@@ -49,6 +51,11 @@ Useful flags:
    - Chronological order preserved
    - Only important decisions/implementation details captured
    - No secrets/credentials/PII (everything sensitive must be redacted)
+1. Validate the journal against the repo (quick final pass):
+   - Skim `git log --oneline --decorate -n 100` for major milestones and date alignment
+   - Spot-check key claims with `rg` (e.g. tool names, file names, feature keywords)
+   - If the journal contains claims that don’t match the codebase or git history, re-run with
+     `--force-journal` (and optionally `--force`) using a higher reasoning effort.
 
 ## Guidelines
 
@@ -60,6 +67,11 @@ Useful flags:
   condensed journal should exclude unrelated sessions (e.g., ad-hoc math questions started in the
   project directory).
 - Update incrementally: do not regenerate unchanged entries unless asked.
+- Do not hand-edit the managed journal section between `<!-- waylog-journal:begin -->` / `<!-- waylog-journal:end -->`;
+  add human notes in the “Manual Notes” section or regenerate via the script.
+- By default, the script runs Codex with `history.persistence=none` and a temp working root (`--cd`) to reduce the
+  chance that `waylog pull` ingests these summarization runs. Set `--codex-history-persistence save-all` if you
+  explicitly want to keep Codex history.
 - The script writes `.waylog-journal/sessions.md` incrementally after each updated entry, so it’s safe
   to interrupt and re-run; completed entries are skipped based on per-file `sha256`.
 - Expect model usage/cost: `codex exec` runs once per changed history file, plus (by default) one

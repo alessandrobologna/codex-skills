@@ -288,10 +288,6 @@ def extract_journal_sessions_sha(text: str) -> str | None:
     return None
 
 
-def looks_like_sessions_file(text: str) -> bool:
-    return (MANAGED_BEGIN in text and MANAGED_END in text and "<!-- waylog-entry:" in text)
-
-
 def parse_entry_meta(line: str) -> dict[str, str] | None:
     m = ENTRY_META_RE.match(line.strip())
     if not m:
@@ -364,6 +360,8 @@ def run_codex_summary(
     codex_bin: str,
     model: str | None,
     reasoning_effort: str | None,
+    history_persistence: str,
+    codex_cd: Path | None,
     schema_path: Path,
     prompt: str,
 ) -> dict[str, Any]:
@@ -373,8 +371,11 @@ def run_codex_summary(
     cmd: list[str] = [codex_bin]
     if model:
         cmd.extend(["-m", model])
+    cmd.extend(["-c", f'history.persistence="{history_persistence}"'])
     if reasoning_effort:
         cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+    if codex_cd is not None:
+        cmd.extend(["--cd", str(codex_cd)])
     cmd.extend(
         [
             "-a",
@@ -382,6 +383,7 @@ def run_codex_summary(
             "-s",
             "read-only",
             "exec",
+            "--skip-git-repo-check",
             "--color",
             "never",
             "--output-schema",
@@ -397,7 +399,7 @@ def run_codex_summary(
             cmd,
             input=prompt,
             text=True,
-            cwd=str(repo_root),
+            cwd=str(codex_cd or repo_root),
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -422,6 +424,8 @@ def run_codex_journal(
     codex_bin: str,
     model: str | None,
     reasoning_effort: str | None,
+    history_persistence: str,
+    codex_cd: Path | None,
     schema_path: Path,
     prompt: str,
 ) -> str:
@@ -430,6 +434,8 @@ def run_codex_journal(
         codex_bin=codex_bin,
         model=model,
         reasoning_effort=reasoning_effort,
+        history_persistence=history_persistence,
+        codex_cd=codex_cd,
         schema_path=schema_path,
         prompt=prompt,
     )
@@ -569,24 +575,6 @@ def render_entry(
             lines.extend(b)
     lines.append(ENTRY_END)
     return "\n".join(lines)
-
-
-def build_default_summary_file() -> str:
-    return "\n".join(
-        [
-            "# Waylog Summary",
-            "",
-            "Auto-generated journal of important decisions and implementation details.",
-            "",
-            f"{MANAGED_BEGIN}",
-            f"{MANAGED_END}",
-            "",
-            "## Manual Notes",
-            f"{MANUAL_BEGIN}",
-            f"{MANUAL_END}",
-            "",
-        ]
-    )
 
 
 def build_default_sessions_file() -> str:
@@ -770,6 +758,17 @@ def main(argv: list[str]) -> int:
         help="Path to codex executable (default: codex)",
     )
     parser.add_argument(
+        "--codex-history-persistence",
+        choices=["save-all", "none"],
+        default="none",
+        help='Codex history persistence for these runs (default: none; avoids polluting waylog via Codex sessions)',
+    )
+    parser.add_argument(
+        "--codex-cd",
+        default=None,
+        help="Run Codex with `--cd` set to this directory (default: temp dir)",
+    )
+    parser.add_argument(
         "--model",
         default=os.environ.get("CODEX_MODEL"),
         help="Override Codex model (default: use Codex config / profile)",
@@ -907,6 +906,11 @@ def main(argv: list[str]) -> int:
         )
 
     with tempfile.TemporaryDirectory() as td:
+        codex_cd = (
+            Path(args.codex_cd).expanduser().resolve() if args.codex_cd else Path(td) / "codex-cd"
+        )
+        codex_cd.mkdir(parents=True, exist_ok=True)
+
         summary_schema_path = Path(td) / "waylog_summary_schema.json"
         summary_schema_path.write_text(json.dumps(SUMMARY_SCHEMA, indent=2), encoding="utf-8")
 
@@ -941,6 +945,8 @@ def main(argv: list[str]) -> int:
                         codex_bin=args.codex_bin,
                         model=model,
                         reasoning_effort=reasoning_effort,
+                        history_persistence=args.codex_history_persistence,
+                        codex_cd=codex_cd,
                         schema_path=summary_schema_path,
                         prompt=prompt,
                     )
@@ -1037,6 +1043,8 @@ def main(argv: list[str]) -> int:
                     codex_bin=args.codex_bin,
                     model=model,
                     reasoning_effort=reasoning_effort,
+                    history_persistence=args.codex_history_persistence,
+                    codex_cd=codex_cd,
                     schema_path=journal_schema_path,
                     prompt=prompt,
                 )
