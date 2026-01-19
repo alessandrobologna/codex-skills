@@ -34,6 +34,8 @@ ENTRY_META_RE = re.compile(r"^<!--\s*waylog-entry:\s*(?P<body>.*?)\s*-->$")
 
 FALLBACK_HIGHLIGHT = "Summary generation failed (see stderr)."
 
+DEFAULT_CODEX_HOME_MODE = "inherit"
+
 
 SUMMARY_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -355,15 +357,22 @@ def json_load_loose(text: str) -> dict[str, Any]:
         return json.loads(text[start : end + 1])
 
 
-def list_codex_mcp_servers(codex_bin: str, *, env: dict[str, str] | None) -> list[dict[str, Any]]:
+def list_codex_mcp_servers(
+    codex_bin: str,
+    *,
+    codex_base_args: list[str],
+    env: dict[str, str] | None,
+    cwd: Path | None,
+) -> list[dict[str, Any]]:
     try:
         proc = subprocess.run(
-            [codex_bin, "mcp", "list", "--json"],
+            [codex_bin, *codex_base_args, "mcp", "list", "--json"],
             text=True,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            cwd=str(cwd) if cwd is not None else None,
         )
     except FileNotFoundError:
         eprint(f"[warn] codex binary not found: {codex_bin!r}")
@@ -517,10 +526,27 @@ def parse_codex_exec_usage_from_jsonl(stdout: str) -> dict[str, int] | None:
     return usage_total if saw_usage else None
 
 
+def build_codex_base_args(
+    *,
+    profile: str | None,
+    oss: bool,
+    local_provider: str | None,
+) -> list[str]:
+    out: list[str] = []
+    if profile:
+        out.extend(["--profile", profile])
+    if oss:
+        out.append("--oss")
+    if local_provider:
+        out.extend(["--local-provider", local_provider])
+    return out
+
+
 def run_codex_summary(
     *,
     repo_root: Path,
     codex_bin: str,
+    codex_base_args: list[str],
     model: str | None,
     reasoning_effort: str | None,
     history_persistence: str,
@@ -533,10 +559,15 @@ def run_codex_summary(
     schema_path: Path,
     prompt: str,
 ) -> tuple[dict[str, Any], dict[str, int] | None]:
-    with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False) as out:
+    with tempfile.NamedTemporaryFile(
+        mode="w+",
+        encoding="utf-8",
+        delete=False,
+        dir=str(schema_path.parent),
+    ) as out:
         out_path = Path(out.name)
 
-    cmd: list[str] = [codex_bin]
+    cmd: list[str] = [codex_bin, *codex_base_args]
     if model:
         cmd.extend(["-m", model])
     cmd.extend(["-c", f'history.persistence="{history_persistence}"'])
@@ -619,6 +650,7 @@ def run_codex_journal(
     *,
     repo_root: Path,
     codex_bin: str,
+    codex_base_args: list[str],
     model: str | None,
     reasoning_effort: str | None,
     history_persistence: str,
@@ -634,6 +666,7 @@ def run_codex_journal(
     data, usage = run_codex_summary(
         repo_root=repo_root,
         codex_bin=codex_bin,
+        codex_base_args=codex_base_args,
         model=model,
         reasoning_effort=reasoning_effort,
         history_persistence=history_persistence,
@@ -663,6 +696,9 @@ def make_prompt(repo_root: Path, session: HistorySession, sensitive_categories: 
             "This summary is specifically for the current repository:",
             f"- repo_name: {repo_root.name}",
             f"- repo_root: {sanitize_text(str(repo_root))}",
+            "",
+            "Tooling constraint:",
+            "- Do NOT run any shell commands or read any files. The full transcript is provided below.",
             "",
             "First determine whether this session is related to this repository's code/spec/docs/tests.",
             "Set `project_relevance` accordingly:",
@@ -965,9 +1001,35 @@ def main(argv: list[str]) -> int:
         help="Path to codex executable (default: codex)",
     )
     parser.add_argument(
+        "--codex-profile",
+        default=os.environ.get("CODEX_PROFILE"),
+        help="Pass through to child `codex` runs as `--profile` (default: inherit env if set)",
+    )
+    parser.add_argument(
+        "--codex-oss",
+        action="store_true",
+        help="Use local OSS provider for child `codex` runs (`codex --oss`)",
+    )
+    parser.add_argument(
+        "--codex-local-provider",
+        choices=["lmstudio", "ollama", "ollama-chat"],
+        default=None,
+        help="Optional local provider when using `--codex-oss` (`codex --local-provider ...`)",
+    )
+    parser.add_argument(
+        "--codex-home-mode",
+        choices=["temp", "inherit"],
+        default=DEFAULT_CODEX_HOME_MODE,
+        help=(
+            "How to set `CODEX_HOME` for child `codex` runs. "
+            "`inherit` keeps the parent environment (default). "
+            "`temp` uses an isolated temp `CODEX_HOME` (seeded from your auth/config)."
+        ),
+    )
+    parser.add_argument(
         "--codex-home",
         default=None,
-        help="Run Codex with `CODEX_HOME` set to this directory (default: inherit)",
+        help="Run Codex with `CODEX_HOME` set to this directory (overrides --codex-home-mode)",
     )
     parser.add_argument(
         "--codex-history-persistence",
@@ -1141,38 +1203,81 @@ def main(argv: list[str]) -> int:
             + (f"reasoning_effort={reasoning_effort}" if reasoning_effort else "reasoning_effort=(default)")
         )
 
-    with tempfile.TemporaryDirectory() as td:
+    def preferred_tmp_base_dir() -> str | None:
+        env = os.environ.get("WAYLOG_JOURNAL_TMPDIR")
+        if env:
+            p = Path(env).expanduser()
+            if p.is_dir() and os.access(p, os.W_OK | os.X_OK):
+                return str(p)
+        p = Path("/tmp")
+        if p.is_dir() and os.access(p, os.W_OK | os.X_OK):
+            return str(p)
+        return None
+
+    with tempfile.TemporaryDirectory(
+        prefix="waylog-journal-",
+        dir=preferred_tmp_base_dir(),
+    ) as td:
         base_env = os.environ.copy()
         seed_home = find_seed_codex_home()
         if seed_home is None:
             eprint("[warn] Could not locate Codex auth/config to seed an isolated CODEX_HOME.")
 
+        codex_temp_home = Path(td) / "codex-home"
+        seed_codex_home(codex_temp_home, seed_home)
+
         codex_env = base_env.copy()
+        codex_fallback_env: dict[str, str] | None = None
+
         if args.codex_home:
             codex_home = Path(args.codex_home).expanduser().resolve()
             seed_codex_home(codex_home, seed_home)
             codex_env["CODEX_HOME"] = str(codex_home)
 
-        codex_fallback_home = Path(td) / "codex-home"
-        seed_codex_home(codex_fallback_home, seed_home)
-        codex_fallback_env = base_env.copy()
-        codex_fallback_env["CODEX_HOME"] = str(codex_fallback_home)
+            # If the user-provided CODEX_HOME isn't writable (common in sandboxed runs),
+            # fall back to an isolated temp CODEX_HOME.
+            codex_fallback_env = base_env.copy()
+            codex_fallback_env["CODEX_HOME"] = str(codex_temp_home)
+        elif args.codex_home_mode == "inherit":
+            codex_fallback_env = base_env.copy()
+            codex_fallback_env["CODEX_HOME"] = str(codex_temp_home)
+        else:
+            codex_env["CODEX_HOME"] = str(codex_temp_home)
 
         codex_retries = max(0, int(args.codex_retries))
         codex_retry_backoff_sec = max(0.0, float(args.codex_retry_backoff_sec))
-
-        codex_config: list[str] = []
-        if args.codex_mcp == "disable-all":
-            servers = list_codex_mcp_servers(args.codex_bin, env=codex_env)
-            if not servers:
-                servers = list_codex_mcp_servers(args.codex_bin, env=codex_fallback_env)
-            codex_config.extend(build_codex_mcp_disable_overrides(servers, only_enabled=False))
-        codex_config.extend([str(cfg) for cfg in (args.codex_config or []) if str(cfg).strip()])
 
         codex_cd = (
             Path(args.codex_cd).expanduser().resolve() if args.codex_cd else Path(td) / "codex-cd"
         )
         codex_cd.mkdir(parents=True, exist_ok=True)
+
+        codex_env["PWD"] = str(codex_cd)
+        if codex_fallback_env is not None:
+            codex_fallback_env["PWD"] = str(codex_cd)
+
+        codex_base_args = build_codex_base_args(
+            profile=(str(args.codex_profile).strip() or None) if args.codex_profile else None,
+            oss=bool(args.codex_oss),
+            local_provider=(str(args.codex_local_provider).strip() or None)
+            if args.codex_local_provider
+            else None,
+        )
+
+        codex_config: list[str] = []
+        if args.codex_mcp == "disable-all":
+            servers = list_codex_mcp_servers(
+                args.codex_bin, codex_base_args=codex_base_args, env=codex_env, cwd=codex_cd
+            )
+            if not servers:
+                servers = list_codex_mcp_servers(
+                    args.codex_bin,
+                    codex_base_args=codex_base_args,
+                    env=codex_fallback_env,
+                    cwd=codex_cd,
+                )
+            codex_config.extend(build_codex_mcp_disable_overrides(servers, only_enabled=False))
+        codex_config.extend([str(cfg) for cfg in (args.codex_config or []) if str(cfg).strip()])
 
         codex_calls_total: int = 0
         codex_calls_with_usage: int = 0
@@ -1184,6 +1289,7 @@ def main(argv: list[str]) -> int:
         printed_auth_hint = False
         printed_network_hint = False
         printed_permission_hint = False
+        abort_due_to_network = False
         had_failures = False
 
         summary_schema_path = Path(td) / "waylog_summary_schema.json"
@@ -1219,6 +1325,7 @@ def main(argv: list[str]) -> int:
                     data, usage = run_codex_summary(
                         repo_root=repo_root,
                         codex_bin=args.codex_bin,
+                        codex_base_args=codex_base_args,
                         model=model,
                         reasoning_effort=reasoning_effort,
                         history_persistence=args.codex_history_persistence,
@@ -1249,9 +1356,18 @@ def main(argv: list[str]) -> int:
                     if not printed_network_hint and is_retryable_codex_error(msg):
                         printed_network_hint = True
                         eprint(
-                            "[hint] This looks like a network failure. Verify connectivity and re-run. "
+                            "[hint] This looks like a network failure. If running inside the Codex "
+                            "`workspace-write` sandbox, enable outbound network access with "
+                            "`sandbox_workspace_write.network_access=true`. Otherwise verify connectivity and re-run. "
                             "Consider lowering `--max-chars`."
                         )
+                    if is_retryable_codex_error(msg):
+                        abort_due_to_network = True
+                        eprint(
+                            "[error] Aborting: Codex could not reach the network from this execution environment. "
+                            "Enable sandbox network access (`sandbox_workspace_write.network_access=true`) and re-run."
+                        )
+                        break
                     if not printed_auth_hint and is_codex_auth_error(msg):
                         printed_auth_hint = True
                         eprint(
@@ -1287,6 +1403,8 @@ def main(argv: list[str]) -> int:
         except KeyboardInterrupt:
             eprint("Interrupted; partial progress is saved. Re-run to continue.")
             return 130
+        if abort_due_to_network:
+            return 3
 
         sessions_body = "\n\n".join([blocks[rel_path] for rel_path in history_order if rel_path in blocks]).strip()
         sessions_sha = sha256_text(sessions_body)
@@ -1319,6 +1437,9 @@ def main(argv: list[str]) -> int:
                         "Input: a list of per-session summaries from `.waylog/history/*.md`.",
                         "Goal: output a usable, low-noise history of the project's evolution (decisions + implementation changes).",
                         "",
+                        "Tooling constraint:",
+                        "- Do NOT run any shell commands or read any files. Use only the provided JSON input.",
+                        "",
                         "Rules:",
                         "- Preserve chronological order.",
                         "- Focus only on items that affected the code/spec/docs/tests of this repository.",
@@ -1349,6 +1470,7 @@ def main(argv: list[str]) -> int:
                     journal_body, usage = run_codex_journal(
                         repo_root=repo_root,
                         codex_bin=args.codex_bin,
+                        codex_base_args=codex_base_args,
                         model=model,
                         reasoning_effort=reasoning_effort,
                         history_persistence=args.codex_history_persistence,
@@ -1387,9 +1509,17 @@ def main(argv: list[str]) -> int:
                     if not printed_network_hint and is_retryable_codex_error(msg):
                         printed_network_hint = True
                         eprint(
-                            "[hint] This looks like a network failure. Verify connectivity and re-run. "
+                            "[hint] This looks like a network failure. If running inside the Codex "
+                            "`workspace-write` sandbox, enable outbound network access with "
+                            "`sandbox_workspace_write.network_access=true`. Otherwise verify connectivity and re-run. "
                             "Consider lowering `--max-chars`."
                         )
+                    if is_retryable_codex_error(msg):
+                        eprint(
+                            "[error] Aborting: Codex could not reach the network from this execution environment. "
+                            "Enable sandbox network access (`sandbox_workspace_write.network_access=true`) and re-run."
+                        )
+                        return 3
                     if not printed_auth_hint and is_codex_auth_error(msg):
                         printed_auth_hint = True
                         eprint(
