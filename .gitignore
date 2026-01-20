@@ -13,6 +13,9 @@
 !/mermaid-github-safe-area/
 !/mermaid-github-safe-area/**
 
+!/git-worktree-feature-flow/
+!/git-worktree-feature-flow/**
+
 # Always ignore local/runtime artifacts (even inside allowlisted skills).
 **/__pycache__/
 *.py[cod]
