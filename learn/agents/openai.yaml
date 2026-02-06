@@ -1,0 +1,4 @@
+interface:
+  display_name: "Learn"
+  short_description: "Research topics and create reusable KB skills"
+  default_prompt: "Learn about a topic, then create a new topic-kb skill with cited sources."
